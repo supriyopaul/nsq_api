@@ -81,7 +81,7 @@ class NsqAPI(tornado.web.RequestHandler):
                 else:
                     try:
                         self.log.info('writing_to_socket')
-                        self.write(msg.body)
+                        self.write(msg.body + '\n')
                         msg.fin()
                         yield self.flush()
                     except Exception as e:
