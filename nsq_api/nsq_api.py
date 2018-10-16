@@ -51,7 +51,7 @@ class NsqAPI(tornado.web.RequestHandler):
     @gen.coroutine
     def get(self):
         '''
-        Sample uri: /tail?nsqd_tcp_address=195.201.98.142:4150&topic=Heartbeat
+        Sample uri: /tail?nsqd_tcp_address=localhost:4150&topic=Heartbeat
         '''
         loop = tornado.ioloop.IOLoop.current()
 
@@ -80,7 +80,6 @@ class NsqAPI(tornado.web.RequestHandler):
                     break
                 else:
                     try:
-                        self.log.info('writing_to_socket')
                         self.write(msg.body + '\n')
                         msg.fin()
                         yield self.flush()
@@ -96,27 +95,38 @@ class NsqServer(BaseScript):
     NAME = 'NsqServer'
     DESC = 'Reads nsq topics'
     NAMESPACE = 'nsq_api'
-    REGISTER_URL = 'http://{master_address}/logagg/v1/register_component?namespace={namespace}&cluster_name={cluster_name}&cluster_passwd={cluster_passwd}&host={host}&port={port}'
-    GET_NSQ_URL = 'http://{master_address}/logagg/v1/get_nsq?cluster_name={cluster_name}' 
-    HEARTBEAT_RESTART_INTERVAL = 5 
+    REGISTER_URL = 'http://{master_address}/logagg/v1/register_nsq_api?key={key}&secret={secret}&host={host}&port={port}'
+    GET_CLUSTER_INFO_URL = 'http://{master_address}/logagg/v1/get_cluster_info?cluster_name={cluster_name}&cluster_passwd={cluster_passwd}' 
+    HEARTBEAT_RESTART_INTERVAL = 30
+
 
     def _init_nsq_sender(self):
         '''
         Initialize nsq sender to send heartbeats
         '''
-        url = self.GET_NSQ_URL.format(master_address=self.master.host+':'+self.master.port,
-                cluster_name=self.master.cluster_name)
+        get_cluster_info_url = self.GET_CLUSTER_INFO_URL.format(master_address=self.master.host+':'+self.master.port,
+                cluster_name=self.master.cluster_name,
+                cluster_passwd=self.master.cluster_passwd)
+        try:
+            get_cluster_info = requests.get(get_cluster_info_url)
+            get_cluster_info_result = json.loads(get_cluster_info.content.decode('utf-8'))
 
-        resp = json.loads(requests.get(url).content)
-        nsqd_http_address = resp['result']['nsqd_http_address']
-        heartbeat_topic = resp['result']['heartbeat_topic']
-        nsq_depth_limit = resp['result']['nsq_depth_limit']
+            if get_cluster_info_result['result']['success']:
+                nsqd_http_address = get_cluster_info_result['result']['cluster_info']['nsqd_http_address']
+                heartbeat_topic = get_cluster_info_result['result']['cluster_info']['heartbeat_topic']
+                nsq_depth_limit = get_cluster_info_result['result']['cluster_info']['nsq_depth_limit']
 
-        nsq_sender_heartbeat = NSQSender(nsqd_http_address,
-                heartbeat_topic,
-                self.log)
-        
-        return nsq_sender_heartbeat
+                nsq_sender_heartbeat = NSQSender(nsqd_http_address,
+                        heartbeat_topic,
+                        self.log)
+            
+                return nsq_sender_heartbeat
+
+            else:
+                err_msg = get_cluster_info_result['result']['details']
+                raise Exception(err_msg)
+        except requests.exceptions.ConnectionError:
+            raise Exception('Could not reach master, url: {}'.format(get_cluster_info_url))
 
     def _parse_master_args(self):
         master = AttrDict()
@@ -126,8 +136,8 @@ class NsqServer(BaseScript):
                 a = a.split('=')
                 if a[0] == 'host': master.host = a[-1]
                 elif a[0] == 'port': master.port = a[-1]
-                elif a[0] == 'cluster_name': master.cluster_name = a[-1]
-                elif a[0] == 'cluster_passwd': master.cluster_passwd = a[-1]
+                elif a[0] == 'key': master.key = a[-1]
+                elif a[0] == 'secret': master.secret = a[-1]
                 else: raise ValueError
         except ValueError:
             raise InvalidArgument(self.args.master)
@@ -137,18 +147,24 @@ class NsqServer(BaseScript):
 
     def register_to_master(self):
         '''
-        'http://localhost:1088/logagg/v1/register_component?namespace=master&cluster_name=logagg&passwd=ad9379b4&host=78.47.113.210&port=1088'
+        'http://localhost:1088/logagg/v1/register_nsq_api?key=xyz&secret=xxxx&host=172.168.0.12&port=1077' 
         '''
         master = self.master
 
-        url = self.REGISTER_URL.format(master_address=master.host+':'+master.port,
-                                namespace=self.NAMESPACE,
-                                cluster_name=master.cluster_name,
-                                cluster_passwd=master.cluster_passwd,
-                                host=self.host,
-                                port=self.port)
+        register_url = self.REGISTER_URL.format(
+                                        master_address=master.host+':'+master.port,
+                                        host=self.host,
+                                        port=self.port,
+                                        key=self.master.key,
+                                        secret=self.master.secret)
 
-        return json.loads(requests.get(url).content)
+        try:
+            register = requests.get(register_url)
+            register_response = json.loads(register.content.decode('utf-8'))
+        except requests.exceptions.ConnectionError:
+            raise Exception('Could not reach master, url: {}'.format(register_url))
+
+        return register_response
 
 
     @keeprunning(HEARTBEAT_RESTART_INTERVAL, on_error=log_exception)
@@ -162,6 +178,7 @@ class NsqServer(BaseScript):
                 'cluster_name': self.master.cluster_name,
                 'timestamp': time.time(),
                 'heartbeat_number': state.heartbeat_number,
+                'actively_tailing': self.actively_tailing
                 }
         self.nsq_sender_heartbeat.handle_heartbeat(heartbeat_payload)
         state.heartbeat_number += 1
@@ -181,19 +198,21 @@ class NsqServer(BaseScript):
         ])
 
     def start(self):
+
+        self.actively_tailing = dict()
         self.master = self._parse_master_args()
         self.host = self.args.host
         self.port = self.args.port
-        self.nsq_sender_heartbeat = self._init_nsq_sender()
+        #self.nsq_sender_heartbeat = self._init_nsq_sender()
 
         register_response = self.register_to_master()
-        if register_response['result']['authentication'] == 'passed':
+        if register_response['result']['success']:
             self.log.info('authentication_passed')
             app = self.prepare_api()
             app.listen(self.args.port)
-            self.th_heartbeat = self.start_heartbeat()
+            #self.th_heartbeat = self.start_heartbeat()
         else:
-            raise AuthenticationFailure(register_response)
+            raise Exception(register_response['result']['details'])
 
         try:
             tornado.ioloop.IOLoop.current().start()
@@ -218,7 +237,7 @@ class NsqServer(BaseScript):
                 help='Hostname of this service for other components to contact to, default: %(default)s')
         runserver_cmd.add_argument('-m', '--master',
                 required=True,
-                help='Master address, in host=<hostname>:port=<port>:cluster_name=<name>:cluster_passwd=<cluster_passwd> format')
+                help='Master address, format: host=<hostname>:port=<port>:key=<master_key>:secret=<master_secret>')
 
 def main():
     NsqServer().start()
