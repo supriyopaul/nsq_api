@@ -3,14 +3,12 @@ import time
 import socket
 import json
 
-from tornado import gen
+from tornado import gen, concurrent
 import tornado.ioloop
 import tornado.web
 import requests
-from nsq.reader import Reader
-from contextlib import closing
+from nsq.reader import Reader, Message
 from basescript import BaseScript
-import Queue
 from deeputil import generate_random_string, AttrDict, keeprunning 
 from logagg_utils import NSQSender
 from logagg_utils import InvalidArgument, AuthenticationFailure
@@ -21,6 +19,7 @@ class NsqAPI(tornado.web.RequestHandler):
     NSQ_MAX_IN_FLIGHT = 200
     CHANNEL_NAME_LENGTH = 6
     DELETE_CHANNEL_URL = 'http://{}/channel/delete?topic={}&channel={}'
+    executor = concurrent.futures.ThreadPoolExecutor(5)
 
     def initialize(self, log):
 
@@ -33,8 +32,12 @@ class NsqAPI(tornado.web.RequestHandler):
 
         nsqd_tcp_addresses=query_arguments['nsqd_tcp_address']
         topic = query_arguments['topic'][0]
+        if query_arguments.get('empty_lines') == ['yes']:
+            empty_lines = True
+        else:
+            empty_lines = False
 
-        return nsqd_tcp_addresses, topic
+        return nsqd_tcp_addresses, topic, empty_lines
 
     def _remove_channel(self, nsqd_host,
             topic, channel):
@@ -51,11 +54,11 @@ class NsqAPI(tornado.web.RequestHandler):
     @gen.coroutine
     def get(self):
         '''
-        Sample uri: /tail?nsqd_tcp_address=localhost:4150&topic=Heartbeat
+        Sample uri: /tail?nsqd_tcp_address=localhost:4150&topic=Heartbeat&empty_lines='yes/no'
         '''
         loop = tornado.ioloop.IOLoop.current()
 
-        nsqd_tcp_addresses, topic = self._parse_query(self.request.query_arguments)
+        nsqd_tcp_addresses, topic, empty_lines = self._parse_query(self.request.query_arguments)
         channel = generate_random_string(self.CHANNEL_NAME_LENGTH)
         nsqd_host = nsqd_tcp_addresses[0].split(':')[0]
 
@@ -69,23 +72,40 @@ class NsqAPI(tornado.web.RequestHandler):
             nsq_reader.close()
             self._remove_channel(nsqd_host=nsqd_host,
                     topic=topic, channel=channel)
-            self.log.info('channel_deleted', channel=channel)
+            self.log.debug('channel_deleted', channel=channel)
             self.finish()
-
+        
         try:
-            for msg in nsq_reader:
-                if self.request.connection.stream.closed():
-                    self.log.info('stream_closed')
-                    cleanup()
-                    break
-                else:
-                    try:
-                        self.write(msg.body + '\n')
-                        msg.fin()
-                        yield self.flush()
-                    except Exception as e:
-                        self.log.warn('error', exp=e)
+            with nsq_reader.connection_checker():
+                start = time.time()
+                msg_list = list()
+
+                while True:
+                    if self.request.connection.stream.closed():
+                        self.log.info('stream_closed')
+                        cleanup()
                         break
+                    
+                    msg = nsq_reader.read()
+                    for m in msg:
+                        self.log.debug('preparing_list', nsqd_tcp_addresses=nsqd_tcp_addresses, topic=topic, channel=channel)
+                        if isinstance(m, Message):
+                            msg_list.append(m.body + '\n')
+                            m.fin()
+
+                    if time.time() - start >= 1:
+                        if msg_list:
+                            result = ''.join(msg_list)
+                            self.log.debug('yield', nsqd_tcp_addresses=nsqd_tcp_addresses, topic=topic, channel=channel, result=result)
+                            self.write(result)
+                            yield self.flush()
+                            msg_list = list()
+                            start = time.time()
+                        else:
+                            self.log.debug('empty', nsqd_tcp_addresses=nsqd_tcp_addresses, topic=topic, channel=channel)
+                            if empty_lines: self.write('\n')
+                            yield self.flush()
+
         except KeyboardInterrupt:
             cleanup()
             sys.exit(0)
@@ -97,8 +117,6 @@ class NsqServer(BaseScript):
     NAMESPACE = 'nsq_api'
     REGISTER_URL = 'http://{master_address}/logagg/v1/register_nsq_api?key={key}&secret={secret}&host={host}&port={port}'
     GET_CLUSTER_INFO_URL = 'http://{master_address}/logagg/v1/get_cluster_info?cluster_name={cluster_name}&cluster_passwd={cluster_passwd}' 
-    HEARTBEAT_RESTART_INTERVAL = 30
-
 
     def _init_nsq_sender(self):
         '''
@@ -167,30 +185,6 @@ class NsqServer(BaseScript):
         return register_response
 
 
-    @keeprunning(HEARTBEAT_RESTART_INTERVAL, on_error=log_exception)
-    def send_heartbeat(self, state):
-        '''
-        Sends continuous heartbeats to a seperate topic in nsq
-        '''
-        heartbeat_payload = {'host': self.host,
-                'port': self.port,
-                'namespace': self.NAMESPACE,
-                'cluster_name': self.master.cluster_name,
-                'timestamp': time.time(),
-                'heartbeat_number': state.heartbeat_number,
-                'actively_tailing': self.actively_tailing
-                }
-        self.nsq_sender_heartbeat.handle_heartbeat(heartbeat_payload)
-        state.heartbeat_number += 1
-        time.sleep(self.HEARTBEAT_RESTART_INTERVAL)
-
-    def start_heartbeat(self):
-        state = AttrDict(heartbeat_number=0)
-        th_heartbeat = start_daemon_thread(self.send_heartbeat, (state,))
-
-        return th_heartbeat
-
-
     def prepare_api(self):
         return tornado.web.Application([
         (r'/tail', NsqAPI,
@@ -203,14 +197,12 @@ class NsqServer(BaseScript):
         self.master = self._parse_master_args()
         self.host = self.args.host
         self.port = self.args.port
-        #self.nsq_sender_heartbeat = self._init_nsq_sender()
 
         register_response = self.register_to_master()
         if register_response['result']['success']:
             self.log.info('authentication_passed')
             app = self.prepare_api()
             app.listen(self.args.port)
-            #self.th_heartbeat = self.start_heartbeat()
         else:
             raise Exception(register_response['result']['details'])
 

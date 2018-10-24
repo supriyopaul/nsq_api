@@ -1,1 +1,1 @@
-from .nsq_api import main
+from .service import main
