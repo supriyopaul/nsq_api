@@ -2,7 +2,7 @@ from setuptools import setup
 from setuptools import find_packages
 setup(
     name="nsq_api",
-    version="0.5.0",
+    version="0.0.1",
     description="API to read logs from NSQ for logagg",
     keywords="nsq-api",
     author="Deep Compute, LLC",
